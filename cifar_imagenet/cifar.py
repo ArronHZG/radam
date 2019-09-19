@@ -36,7 +36,7 @@ parser.add_argument('-d', '--dataset', default='cifar10', type=str)
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
                     help='number of data loading workers (default: 4)')
 # Optimization options
-parser.add_argument('--epochs', default=300, type=int, metavar='N',
+parser.add_argument('--epochs', default=1000, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
                     help='manual epoch number (useful on restarts)')
@@ -65,7 +65,7 @@ parser.add_argument('--weight-decay', '--wd', default=5e-4, type=float,
 # Checkpoints
 parser.add_argument('-c', '--checkpoint', default='checkpoint', type=str, metavar='PATH',
                     help='path to save checkpoint (default: checkpoint)')
-parser.add_argument('--resume', default='', type=str, metavar='PATH',
+parser.add_argument('--resume', default='./checkpoint/checkpoint.pth.tar', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
 # Architecture
 parser.add_argument('--arch', '-a', metavar='ARCH', default='resnet',
@@ -111,6 +111,16 @@ if use_cuda:
 best_acc = 0  # best test accuracy
 
 
+def auto_reset_learning_rate(optimizer, lr):
+    if optimizer.param_groups[0]['lr'] <= 5e-3:
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+
+def get_lr(optimizer):
+    return optimizer.param_groups[0]['lr']
+
+
 def main():
     global best_acc
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
@@ -123,6 +133,9 @@ def main():
     transform_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
         transforms.RandomHorizontalFlip(),
+        transforms.RandomAffine(5),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(30),
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
@@ -192,22 +205,28 @@ def main():
     elif args.optimizer.lower() == 'adamw':
         optimizer = AdamW(model.parameters(), lr=args.lr, betas=(args.beta1, args.beta2),
                           weight_decay=args.weight_decay, warmup=args.warmup)
+
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max',
+                                                           factor=0.9,
+                                                           patience=3,
+                                                           verbose=True)
     # Resume
     title = 'cifar-10-' + args.arch
-    # if args.resume:
-    #     # Load checkpoint.
-    #     print('==> Resuming from checkpoint..')
-    #     assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
-    #     args.checkpoint = os.path.dirname(args.resume)
-    #     checkpoint = torch.load(args.resume)
-    #     best_acc = checkpoint['best_acc']
-    #     start_epoch = checkpoint['epoch']
-    #     model.load_state_dict(checkpoint['state_dict'])
-    #     optimizer.load_state_dict(checkpoint['optimizer'])
-    #     logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
-    # else:
-    logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
-    logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
+    if args.resume:
+        # Load checkpoint.
+        print('==> Resuming from checkpoint..')
+        assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
+        args.checkpoint = os.path.dirname(args.resume)
+        checkpoint = torch.load(args.resume)
+        best_acc = checkpoint['best_acc']
+        start_epoch = checkpoint['epoch']
+        model.load_state_dict(checkpoint['state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title, resume=True)
+    else:
+        logger = Logger(os.path.join(args.checkpoint, 'log.txt'), title=title)
+        logger.set_names(['Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
+        # logger.set_names(['Epoch', 'Learning Rate', 'Train Loss', 'Valid Loss', 'Train Acc.', 'Valid Acc.'])
 
     if args.evaluate:
         print('\nEvaluation only')
@@ -217,21 +236,15 @@ def main():
 
     # Train and val
     for epoch in range(start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
-
-        print('\nEpoch: [%s | %d] LR: %f' % (f"{epoch + 1}".zfill(3), args.epochs, state['lr']), end="  ")
-
         train_loss, train_acc = train(trainloader, model, criterion, optimizer, epoch, use_cuda)
         test_loss, test_acc = test(testloader, model, criterion, epoch, use_cuda)
 
         # append logger file
-        logger.append([state['lr'], train_loss, test_loss, train_acc, test_acc])
-        writer.add_scalars('train/lr', {args.model_name: state['lr']}, epoch)
+        # logger.append([epoch + 1, f"{get_lr(optimizer)}", train_loss, test_loss, train_acc, test_acc])
+        logger.append([get_lr(optimizer), train_loss, test_loss, train_acc, test_acc])
+        writer.add_scalars('train/lr', {args.model_name: get_lr(optimizer)}, epoch)
         writer.add_scalars('loss_tracking/loss', {"train_loss": train_loss, "test_loss": test_loss}, epoch)
         writer.add_scalars('loss_tracking/acc', {"train_acc": train_acc, "test_acc": test_acc}, epoch)
-
-        print(
-            f'train_loss: {train_loss:.5f}  test_loss: {test_loss:.5f}  train_acc: {train_acc:.5f}  test_acc: {test_acc:.5f}')
 
         # save model
         is_best = test_acc > best_acc
@@ -243,6 +256,10 @@ def main():
             'best_acc': best_acc,
             'optimizer': optimizer.state_dict(),
         }, is_best, checkpoint=args.checkpoint)
+
+        # set lr
+        scheduler.step(test_acc)
+        auto_reset_learning_rate(optimizer, args.lr)
 
     logger.close()
     logger.plot()
@@ -369,12 +386,12 @@ def save_checkpoint(state, is_best, checkpoint='checkpoint', filename='checkpoin
         shutil.copyfile(filepath, os.path.join(checkpoint, 'model_best.pth.tar'))
 
 
-def adjust_learning_rate(optimizer, epoch):
-    global state
-    if epoch in args.schedule:
-        state['lr'] *= args.gamma
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = state['lr']
+# def adjust_learning_rate(optimizer, epoch):
+#     global state
+#     if epoch in args.schedule:
+#         state['lr'] *= args.gamma
+#         for param_group in optimizer.param_groups:
+#             param_group['lr'] = state['lr']
 
 
 if __name__ == '__main__':
